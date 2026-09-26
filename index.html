@@ -85,6 +85,36 @@
   .dot.fixed{ background:#9fb4cc; }
   @keyframes flashGreen{ 0%{ background:rgba(61,220,132,0.7); } 100%{ background:rgba(255,255,255,0.1); } }
 
+  .addr-row{ margin-top:6px; min-height:16px; }
+  .addr-link{
+    background:none; border:none; padding:0; color:rgba(255,255,255,0.65);
+    font-size:11.5px; font-weight:600; text-decoration:underline; text-underline-offset:2px;
+  }
+  .addr-link:active{ color:#fff; }
+  .addr-using{ display:flex; align-items:center; gap:8px; font-size:11.5px; color:rgba(255,255,255,0.85); flex-wrap:wrap; }
+  .addr-using b{ color:#fff; font-weight:700; }
+  .addr-switch{
+    background:none; border:none; padding:0; color:var(--yellow); font-weight:700;
+    text-decoration:underline; text-underline-offset:2px; font-size:11.5px;
+  }
+  .addr-input-row{ display:flex; gap:8px; margin-top:8px; }
+  .addr-input-row input{
+    flex:1; min-width:0; background:rgba(255,255,255,0.12); border:1px solid rgba(255,255,255,0.28);
+    color:#fff; border-radius:8px; padding:8px 10px; font-size:13px; outline:none;
+  }
+  .addr-input-row input::placeholder{ color:rgba(255,255,255,0.5); }
+  .addr-input-row button{
+    flex-shrink:0; background:var(--yellow); color:#fff; border:none; font-weight:700; font-size:12.5px;
+    padding:0 16px; border-radius:8px;
+  }
+  .addr-input-row button:disabled{ opacity:0.6; }
+  .addr-input-row button.addr-cancel-btn{
+    flex-shrink:0; background:rgba(255,255,255,0.12); color:#fff; border:none;
+    width:34px; padding:0; border-radius:8px; font-size:13px;
+  }
+  .addr-input-row button.addr-cancel-btn:active{ background:rgba(255,255,255,0.25); }
+  .addr-error{ margin-top:6px; font-size:11.5px; color:#ffb4b4; }
+
   /* ---------- controls ---------- */
   .controls{
     background:var(--card);
@@ -265,6 +295,13 @@
     <button class="gps-refresh" id="gpsRefreshBtn" title="Refresh location">↻</button>
     <button class="gps-live-btn" id="liveToggleBtn" title="Live tracking">GPS</button>
   </div>
+  <div class="addr-row" id="addrRow"></div>
+  <div class="addr-input-row" id="addrInputRow" style="display:none;">
+    <input type="text" id="addrInput" placeholder="Postcode or address" autocomplete="off" autocorrect="off">
+    <button class="addr-go-btn" id="addrGoBtn">Find</button>
+    <button class="addr-cancel-btn" id="addrCancelBtn">✕</button>
+  </div>
+  <div class="addr-error" id="addrError" style="display:none;"></div>
 </header>
 
 <div class="controls" id="controls" style="display:none;">
@@ -379,7 +416,9 @@
     freqFilter: "regular", // "regular" | "onrequest"
     settings: { amber: 12, red: 24 },
     watchId: null,
-    liveEnabled: false
+    liveEnabled: false,
+    locationMode: "gps", // "gps" | "manual"
+    manualLabel: null
   };
 
   // ---------- CSV parsing (RFC4180-ish, handles quoted fields) ----------
@@ -567,6 +606,12 @@
   var settingsBtn = document.getElementById("settingsBtn");
   var gpsRefreshBtn = document.getElementById("gpsRefreshBtn");
   var liveToggleBtn = document.getElementById("liveToggleBtn");
+  var addrRow = document.getElementById("addrRow");
+  var addrInputRow = document.getElementById("addrInputRow");
+  var addrInput = document.getElementById("addrInput");
+  var addrGoBtn = document.getElementById("addrGoBtn");
+  var addrCancelBtn = document.getElementById("addrCancelBtn");
+  var addrError = document.getElementById("addrError");
   var sheetBackdrop = document.getElementById("sheetBackdrop");
   var closeSheetBtn = document.getElementById("closeSheetBtn");
   var uploadNewBtn = document.getElementById("uploadNewBtn");
@@ -695,8 +740,10 @@
 
   function onGeoSuccess(p){
     geoDenied = false;
+    state.locationMode = "gps";
     state.pos = { lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy };
     state.posUpdatedAt = Date.now();
+    renderAddrRow();
     updateStatusDisplay();
     renderList();
   }
@@ -715,6 +762,11 @@
 
   function updateStatusDisplay(){
     if (!state.pos) return; // error/waiting text already set by the caller
+    if (state.locationMode === "manual"){
+      statusDot.className = "dot fixed";
+      statusText.innerHTML = "<b>Address</b> · " + esc(state.manualLabel || "");
+      return;
+    }
     var ageMs = Date.now() - state.posUpdatedAt;
     var secs = Math.round(ageMs / 1000);
     var ageStr = secs < 60 ? secs + "s ago" : Math.round(secs / 60) + "m ago";
@@ -731,6 +783,98 @@
       statusText.innerHTML = "<b>Fixed</b> · accuracy ±" + Math.round(state.pos.accuracy) + "m · " + ageStr;
     }
   }
+
+  // ---------- manual address entry ----------
+  // Falls back to a typed postcode/address when GPS isn't available or
+  // convenient — e.g. planning ahead for a street you haven't reached yet.
+  function geocode(query){
+    query = query.trim();
+    if (!query) return Promise.resolve(null);
+
+    // UK postcodes (full or partial) — postcodes.io is fast and built for this.
+    return fetch("https://api.postcodes.io/postcodes?q=" + encodeURIComponent(query) + "&limit=1")
+      .then(function(res){ return res.json(); })
+      .then(function(data){
+        if (data && data.result && data.result.length){
+          var r = data.result[0];
+          return { lat: r.latitude, lng: r.longitude, label: r.postcode };
+        }
+        // Fall back to a general UK address search.
+        return fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=gb&q=" + encodeURIComponent(query))
+          .then(function(res2){ return res2.json(); })
+          .then(function(data2){
+            if (data2 && data2.length){
+              return { lat: parseFloat(data2[0].lat), lng: parseFloat(data2[0].lon), label: data2[0].display_name };
+            }
+            return null;
+          });
+      })
+      .catch(function(){ return null; });
+  }
+
+  function showAddrError(msg){ addrError.textContent = msg; addrError.style.display = "block"; }
+  function clearAddrError(){ addrError.style.display = "none"; }
+
+  function showAddrInput(){
+    addrRow.style.display = "none";
+    addrInputRow.style.display = "flex";
+    addrInput.focus();
+  }
+
+  function renderAddrRow(){
+    clearAddrError();
+    addrRow.style.display = "block";
+    if (state.locationMode === "manual"){
+      addrRow.innerHTML = '<div class="addr-using">📍 <b>' + esc(state.manualLabel) + '</b> <button class="addr-switch" id="addrSwitchBtn">Use GPS instead</button></div>';
+      document.getElementById("addrSwitchBtn").addEventListener("click", function(){
+        state.locationMode = "gps";
+        statusDot.className = "dot wait";
+        statusText.textContent = "Finding your location…";
+        renderAddrRow();
+        oneShotFix();
+      });
+    } else {
+      addrRow.innerHTML = '<button class="addr-link" id="addrToggleBtn">⌨️ Or type an address</button>';
+      document.getElementById("addrToggleBtn").addEventListener("click", showAddrInput);
+    }
+  }
+
+  function submitAddress(){
+    var q = addrInput.value.trim();
+    if (!q) return;
+    addrGoBtn.disabled = true;
+    addrGoBtn.textContent = "…";
+    clearAddrError();
+    geocode(q).then(function(result){
+      addrGoBtn.disabled = false;
+      addrGoBtn.textContent = "Find";
+      if (!result){
+        showAddrError("Couldn't find that — try a full postcode.");
+        return;
+      }
+      if (state.watchId !== null){ stopWatch(); }
+      state.locationMode = "manual";
+      state.manualLabel = result.label;
+      state.pos = { lat: result.lat, lng: result.lng, accuracy: null };
+      state.posUpdatedAt = Date.now();
+      addrInputRow.style.display = "none";
+      addrInput.value = "";
+      renderAddrRow();
+      updateStatusDisplay();
+      renderList();
+    });
+  }
+
+  addrGoBtn.addEventListener("click", submitAddress);
+  addrInput.addEventListener("keydown", function(e){
+    if (e.key === "Enter"){ e.preventDefault(); submitAddress(); }
+  });
+  addrCancelBtn.addEventListener("click", function(){
+    addrInputRow.style.display = "none";
+    addrInput.value = "";
+    clearAddrError();
+    renderAddrRow();
+  });
 
   // Keeps the "Xs/Xm ago" text ticking, and (only while live tracking is on)
   // flags the fix as stale if the watch has quietly stalled.
@@ -923,6 +1067,7 @@
   redSlider.value = state.settings.red;
   amberVal.textContent = state.settings.amber;
   redVal.textContent = state.settings.red;
+  renderAddrRow();
 
   if (checkForPreviousData()){
     enterApp();
